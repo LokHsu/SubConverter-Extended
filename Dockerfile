@@ -16,21 +16,8 @@ ARG ENABLE_SANITIZERS=false
 
 WORKDIR /build/bridge
 
-<<<<<<< HEAD
 # Debian 使用 apt 包管理器
 RUN apt-get update && \
-=======
-# 使用国内 Debian 镜像源，避免 apt 流量绕代理
-RUN set -eux; \
-    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
-      [ -f "$f" ] || continue; \
-      sed -i -E 's#https?://(deb|security)\.debian\.org#http://mirrors.aliyun.com#g' "$f"; \
-    done
-
-# Debian 使用 apt 包管理器；unset 代理，否则国内源也会绕回代理网关
-RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; \
-    apt-get update && \
->>>>>>> 361f4e0 (custom: direct .list ruleset support)
     apt-get install -y --no-install-recommends git build-essential && \
     rm -rf /var/lib/apt/lists/*
 
@@ -43,17 +30,7 @@ COPY bridge/preprocess.go ./
 COPY bridge/mieru.go ./
 COPY bridge/cmd/portable-updater/ ./cmd/portable-updater/
 
-<<<<<<< HEAD
 RUN set -xe && \
-=======
-# Go 模块走国内代理，可用 --build-arg GOPROXY=... 覆盖
-ARG GOPROXY=https://goproxy.cn,direct
-ENV GOPROXY=${GOPROXY}
-
-# unset 代理，goproxy.cn 直连更快；下面拉 github 依赖时才需要代理
-RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY && \
-    set -xe && \
->>>>>>> 361f4e0 (custom: direct .list ruleset support)
     retry_go_dependency() { \
       attempt=1; \
       while ! "$@"; do \
@@ -179,21 +156,8 @@ ARG ENABLE_SANITIZERS=false
 
 WORKDIR /
 
-<<<<<<< HEAD
 # 安装 Debian 构建依赖
 RUN apt-get update && \
-=======
-# 使用国内 Debian 镜像源，避免 apt 流量绕代理
-RUN set -eux; \
-    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
-      [ -f "$f" ] || continue; \
-      sed -i -E 's#https?://(deb|security)\.debian\.org#http://mirrors.aliyun.com#g' "$f"; \
-    done
-
-# 安装 Debian 构建依赖；unset 代理，否则国内源也会绕回代理网关
-RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; \
-    apt-get update && \
->>>>>>> 361f4e0 (custom: direct .list ruleset support)
     apt-get install -y --no-install-recommends \
     git g++ build-essential cmake python3 python3-pip \
     pkg-config curl \
@@ -384,6 +348,7 @@ RUN if [ "${BUILD_TESTS}" = "true" ]; then \
     fi
 
 # 收集 glibc 运行时依赖（动态探测，避免固定版本）
+# 供 ci-export/便携版打包使用；下面的 Docker 运行时镜像本身由 apt 提供 glibc 库
 RUN set -xe && \
     mkdir -p /runtime-libs && \
     ELF_LIBRARY_PATH="/usr/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib64" \
@@ -413,8 +378,12 @@ COPY --from=builder /src/include /src/include
 CMD ["/src/subconverter"]
 
 # ========== FINAL STAGE ==========
-# Alpine 运行时 + 搬运 glibc 依赖（不固定版本）
-FROM ${ALPINE_IMAGE}
+# 运行时使用 Debian (glibc)，与编译产物一致。
+# 旧做法是在 Alpine (musl) 之上搬运 glibc 库并把这些目录写进全局
+# LD_LIBRARY_PATH；musl 加载器同样优先读该变量，于是 apk、busybox 等
+# Alpine 程序会加载到 glibc 版的 libz/libssl/libcrypto/libstdc++，
+# 表现为动态库加载失败。改用 glibc 运行时后不再出现这种混装。
+FROM ${DEBIAN_TRIXIE_SLIM_IMAGE}
 
 ARG VERSION="dev"
 ARG SHA=""
@@ -433,36 +402,46 @@ LABEL \
   maintainer="Aethersailor"
 
 ENV TZ=Asia/Shanghai
-<<<<<<< HEAD
-RUN apk add --no-cache ca-certificates tzdata && \
-=======
-RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; \
-    sed -i 's#dl-cdn.alpinelinux.org#mirrors.aliyun.com#g' /etc/apk/repositories && \
-    apk add --no-cache ca-certificates tzdata && \
->>>>>>> 361f4e0 (custom: direct .list ruleset support)
-    ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
-    echo $TZ > /etc/timezone
+
+# 运行时依赖交给 apt：multiarch 目录、符号链接与 /etc/ld.so.cache 全部由包管理器维护
+# 包名按候选版本动态选择，避免 Debian 改名或 t64 迁移后写死包名
+RUN set -eux; \
+    pick_package() { \
+      for candidate in "$@"; do \
+        if apt-cache policy "$candidate" 2>/dev/null | grep -q 'Candidate: [0-9]'; then \
+          printf '%s\n' "$candidate"; \
+          return 0; \
+        fi; \
+      done; \
+      echo "no installable package among: $*" >&2; \
+      return 1; \
+    }; \
+    apt-get update; \
+    curl_runtime="$(pick_package libcurl4 libcurl4t64)"; \
+    yaml_runtime="$(pick_package libyaml-cpp0.8 libyaml-cpp0.7 libyaml-cpp-dev)"; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates \
+      tzdata \
+      "$curl_runtime" \
+      libpcre2-8-0 \
+      libstdc++6 \
+      "$yaml_runtime"; \
+    rm -rf /var/lib/apt/lists/*; \
+    ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime; \
+    echo "${TZ}" > /etc/timezone
 
 COPY --from=builder --chmod=0755 /src/subconverter /usr/bin/subconverter
+COPY --from=go-builder --chmod=0755 /build/bridge/libmihomo.so /usr/lib/libmihomo.so
 COPY --from=builder /src/base /base/
-COPY --from=builder /runtime-libs/ /
 
-ENV LD_LIBRARY_PATH="/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib64:/usr/lib"
+# 让 libmihomo.so 与 apt 安装的运行时库一起进入 ld.so.cache
+RUN ldconfig
 
 WORKDIR /base
 RUN set -e && \
     printf '%s\n' \
       '#!/bin/sh' \
       'set -e' \
-      'ARCH="$(uname -m)"' \
-      'case "$ARCH" in' \
-      '  x86_64) LIB_ARCH="x86_64-linux-gnu" ;;' \
-      '  aarch64|arm64) LIB_ARCH="aarch64-linux-gnu" ;;' \
-      '  *) LIB_ARCH="" ;;' \
-      'esac' \
-      'if [ -n "$LIB_ARCH" ]; then' \
-      '  export LD_LIBRARY_PATH="/lib/${LIB_ARCH}:/usr/lib/${LIB_ARCH}:/lib64:/usr/lib"' \
-      'fi' \
       'CONF="${PREF_PATH:-/base/pref.toml}"' \
       'CONF_DIR="$(dirname "$CONF")"' \
       'mkdir -p "$CONF_DIR"' \
