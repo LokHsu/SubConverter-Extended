@@ -16,8 +16,21 @@ ARG ENABLE_SANITIZERS=false
 
 WORKDIR /build/bridge
 
+<<<<<<< HEAD
 # Debian 使用 apt 包管理器
 RUN apt-get update && \
+=======
+# 使用国内 Debian 镜像源，避免 apt 流量绕代理
+RUN set -eux; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+      [ -f "$f" ] || continue; \
+      sed -i -E 's#https?://(deb|security)\.debian\.org#http://mirrors.aliyun.com#g' "$f"; \
+    done
+
+# Debian 使用 apt 包管理器；unset 代理，否则国内源也会绕回代理网关
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; \
+    apt-get update && \
+>>>>>>> 361f4e0 (custom: direct .list ruleset support)
     apt-get install -y --no-install-recommends git build-essential && \
     rm -rf /var/lib/apt/lists/*
 
@@ -30,7 +43,17 @@ COPY bridge/preprocess.go ./
 COPY bridge/mieru.go ./
 COPY bridge/cmd/portable-updater/ ./cmd/portable-updater/
 
+<<<<<<< HEAD
 RUN set -xe && \
+=======
+# Go 模块走国内代理，可用 --build-arg GOPROXY=... 覆盖
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY}
+
+# unset 代理，goproxy.cn 直连更快；下面拉 github 依赖时才需要代理
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY && \
+    set -xe && \
+>>>>>>> 361f4e0 (custom: direct .list ruleset support)
     retry_go_dependency() { \
       attempt=1; \
       while ! "$@"; do \
@@ -156,8 +179,21 @@ ARG ENABLE_SANITIZERS=false
 
 WORKDIR /
 
+<<<<<<< HEAD
 # 安装 Debian 构建依赖
 RUN apt-get update && \
+=======
+# 使用国内 Debian 镜像源，避免 apt 流量绕代理
+RUN set -eux; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+      [ -f "$f" ] || continue; \
+      sed -i -E 's#https?://(deb|security)\.debian\.org#http://mirrors.aliyun.com#g' "$f"; \
+    done
+
+# 安装 Debian 构建依赖；unset 代理，否则国内源也会绕回代理网关
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; \
+    apt-get update && \
+>>>>>>> 361f4e0 (custom: direct .list ruleset support)
     apt-get install -y --no-install-recommends \
     git g++ build-essential cmake python3 python3-pip \
     pkg-config curl \
@@ -397,7 +433,13 @@ LABEL \
   maintainer="Aethersailor"
 
 ENV TZ=Asia/Shanghai
+<<<<<<< HEAD
 RUN apk add --no-cache ca-certificates tzdata && \
+=======
+RUN unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; \
+    sed -i 's#dl-cdn.alpinelinux.org#mirrors.aliyun.com#g' /etc/apk/repositories && \
+    apk add --no-cache ca-certificates tzdata && \
+>>>>>>> 361f4e0 (custom: direct .list ruleset support)
     ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && \
     echo $TZ > /etc/timezone
 
