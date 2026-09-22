@@ -86,7 +86,17 @@ struct curl_progress_data
     uint64_t context_retained_bytes = 0;
     RetainedResponseByteLease retained_bytes;
     AsyncFetchFailure abort_reason = AsyncFetchFailure::None;
+    bool abort_on_stall = false;
 };
+
+// 带 GitHub 回退的取源在长时间收不到数据时立即放弃当前尝试，避免直连被黑洞时
+// 占满整个请求预算，回退源拿不到时间。1 字节/秒以上视为仍在传输，正常下载不受影响。
+// 判定窗口同时也是连接阶段（DNS/TCP/TLS）的上限，黑洞网络下直连最多占用这么久。
+static constexpr long github_fallback_stall_bytes_per_second = 1;
+static constexpr long github_fallback_stall_seconds = 3;
+// 请求本身没有截止时间时（少见）给单个回退源的整段尝试时间，与停滞判定无关，
+// 因此不随判定窗口收紧，免得正常但较慢的下载被掐断。
+static constexpr long github_fallback_attempt_seconds = 10;
 
 static std::atomic<uint64_t> cache_fetch_payload_retained_bytes{0};
 static std::atomic<uint64_t> cache_fetch_payload_peak_retained_bytes{0};
@@ -1022,8 +1032,103 @@ static bool parse_github_file_url(const std::string &url, GitHubFileRef &file_re
     return split_github_ref_path(segments, 3, file_ref.ref, file_ref.path);
 }
 
-static bool build_jsdelivr_github_url(const std::string &url,
-                                      std::string &fallback_url)
+// GitHub 加速代理：直接在原始地址前拼接域名即可取到同一份内容，按顺序尝试。
+// 列表只取自 preference 文件同目录下的 github-proxies.txt（容器内为
+// /base/github-proxies.txt），便于挂载后直接修改；文件缺失或为空时不走代理。
+static const char *const github_proxies_file = "github-proxies.txt";
+
+static std::string parse_github_proxy_prefix(const std::string &line)
+{
+    std::string prefix = trimWhitespace(line, true, true);
+    if(prefix.empty() || prefix[0] == '#' || prefix[0] == ';')
+        return "";
+    if(!startsWith(prefix, "http://") && !startsWith(prefix, "https://"))
+    {
+        writeLog(LOG_LEVEL_WARNING,
+                 "已忽略无法识别的 GitHub 加速代理条目：" + prefix);
+        return "";
+    }
+    while(!prefix.empty() && prefix.back() == '/')
+        prefix.pop_back();
+    return prefix.empty() ? "" : prefix + "/";
+}
+
+static string_array load_github_proxy_prefixes()
+{
+    string_array prefixes;
+    if(!fileExist(github_proxies_file))
+    {
+        writeLog(LOG_LEVEL_WARNING,
+                 "未找到 GitHub 加速代理列表文件，将不启用加速代理：" +
+                     std::string(github_proxies_file));
+        return prefixes;
+    }
+
+    std::string content = fileGet(github_proxies_file, false);
+    removeUTF8BOM(content);
+    for(const std::string &line : split(content, "\n"))
+    {
+        std::string prefix = parse_github_proxy_prefix(line);
+        if(!prefix.empty())
+            prefixes.push_back(std::move(prefix));
+    }
+    if(prefixes.empty())
+        writeLog(LOG_LEVEL_WARNING,
+                 "GitHub 加速代理列表为空，将不启用加速代理：" +
+                     std::string(github_proxies_file));
+    else
+        writeLog(LOG_LEVEL_INFO,
+                 "已从 " + std::string(github_proxies_file) + " 加载 " +
+                     std::to_string(prefixes.size()) +
+                     " 个 GitHub 加速代理。");
+    return prefixes;
+}
+
+static const string_array &github_proxy_prefixes()
+{
+    static const string_array prefixes = load_github_proxy_prefixes();
+    return prefixes;
+}
+
+// 直连失败后，回退源若沿用同一个截止时间，很可能预算已被直连耗光而被立刻中止；
+// 这里按剩余尝试次数均分剩余预算，保证链上每个来源都有机会被真正尝试一次。
+static std::chrono::steady_clock::time_point github_fallback_deadline(
+    std::chrono::steady_clock::time_point request_deadline,
+    size_t attempts_left)
+{
+    constexpr auto no_deadline =
+        std::chrono::steady_clock::time_point::max();
+    const auto now = std::chrono::steady_clock::now();
+    if(request_deadline == no_deadline)
+        return now + std::chrono::seconds(github_fallback_attempt_seconds);
+    const auto remaining = request_deadline - now;
+    if(remaining <= std::chrono::milliseconds::zero())
+        return request_deadline;
+    const auto share = attempts_left > 1
+        ? remaining / static_cast<int64_t>(attempts_left)
+        : remaining;
+    return now + share;
+}
+
+// 预算已经耗光时，再把回退源提交上去只会被引擎立刻判定超时，逐条失败还会刷屏；
+// 这种链直接结束。
+static bool github_fallback_budget_exhausted(
+    std::chrono::steady_clock::time_point request_deadline)
+{
+    return request_deadline != std::chrono::steady_clock::time_point::max() &&
+           std::chrono::steady_clock::now() >= request_deadline;
+}
+
+// 回退链的日志约定：每个取源最多一行（命中一行 INFO，整条链都没命中一行
+// WARN），逐条尝试与每条失败原因留在 VERBOSE。
+static std::string github_fallback_attempt_label(size_t index, size_t total)
+{
+    return "（第 " + std::to_string(index) + "/" + std::to_string(total) +
+           " 个）";
+}
+
+static bool build_github_fallback_urls(const std::string &url,
+                                       string_array &fallback_urls)
 {
     GitHubFileRef file_ref;
     std::string clean_url = strip_url_query_fragment(url);
@@ -1031,9 +1136,13 @@ static bool build_jsdelivr_github_url(const std::string &url,
        !parse_github_file_url(clean_url, file_ref))
         return false;
 
+    for(const std::string &prefix : github_proxy_prefixes())
+        fallback_urls.push_back(prefix + clean_url);
+
     const std::string scheme = startsWith(clean_url, "http://") ? "http" : "https";
-    fallback_url = scheme + "://cdn.jsdelivr.net/gh/" + file_ref.owner + "/" +
-                   file_ref.repo + "@" + file_ref.ref + "/" + file_ref.path;
+    fallback_urls.push_back(scheme + "://cdn.jsdelivr.net/gh/" + file_ref.owner +
+                            "/" + file_ref.repo + "@" + file_ref.ref + "/" +
+                            file_ref.path);
     return true;
 }
 
@@ -1192,7 +1301,7 @@ static int public_fetch_prereq_callback(void *clientp, char *conn_primary_ip,
 }
 #endif
 
-static bool should_try_jsdelivr_fallback(CURLcode ret_code, int status_code)
+static bool should_try_github_fallback(CURLcode ret_code, int status_code)
 {
     if(ret_code != CURLE_OK)
     {
@@ -1438,6 +1547,16 @@ static inline void curl_set_common_options(CURL *curl_handle, const char *url,
                                 static_cast<int64_t>(LONG_MAX)));
     }
     curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT_MS, timeout_ms);
+    if(data && data->abort_on_stall)
+    {
+        curl_easy_setopt(curl_handle, CURLOPT_LOW_SPEED_LIMIT,
+                         github_fallback_stall_bytes_per_second);
+        curl_easy_setopt(curl_handle, CURLOPT_LOW_SPEED_TIME,
+                         github_fallback_stall_seconds);
+        // LOW_SPEED 只管传输阶段；连接阶段被黑洞时靠这个上限兜底。
+        curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT,
+                         github_fallback_stall_seconds);
+    }
     curl_easy_setopt(curl_handle, CURLOPT_COOKIEFILE, "");
     if(data)
     {
@@ -1556,6 +1675,14 @@ static bool is_recoverable_curl_error(CURLcode code)
     default:
         return false;
     }
+}
+
+// 停滞中止说明这条链路在当下根本取不到数据，重试同一个地址只会再等满一个停滞
+// 窗口；回退链本来就会换一条路，这里直接判为不值得重试。
+static bool should_retry_curl_error(CURLcode code, bool abort_on_stall)
+{
+    return is_recoverable_curl_error(code) &&
+           !(abort_on_stall && code == CURLE_OPERATION_TIMEDOUT);
 }
 
 static bool performanceFetchMode(const ResourceControlSnapshot &resources)
@@ -2105,6 +2232,7 @@ private:
 
         transfer->progress.size_limit = transfer->size_limit;
         transfer->progress.deadline = transfer->request.deadline;
+        transfer->progress.abort_on_stall = transfer->request.abort_on_stall;
         transfer->progress.cancellation = transfer->request.cancellation;
         if(transfer->request.request_context &&
            !transfer->request.retain_result_bytes)
@@ -2250,7 +2378,8 @@ private:
         const bool recoverable = code != CURLE_OK &&
             (transfer->request.method == HTTP_GET ||
              transfer->request.method == HTTP_HEAD) &&
-            is_recoverable_curl_error(code);
+            should_retry_curl_error(code,
+                                    transfer->request.abort_on_stall);
         const bool performance_retry =
             performance_mode_ && transfer->request.method == HTTP_GET;
         const uint8_t retry_limit = performance_retry ? max_retries_ : 1;
@@ -3239,6 +3368,7 @@ static int curlGetSyncLegacy(const FetchArgument &argument,
     curl_progress_data limit;
     limit.size_limit = effectiveSettings().maxAllowedDownloadSize;
     limit.deadline = networkFetchDeadline(argument.deadline);
+    limit.abort_on_stall = argument.abort_on_stall;
     limit.cancellation = argument.cancellation.valid()
                              ? argument.cancellation
                              : (captureCurrentRequestContext()
@@ -3343,7 +3473,7 @@ static int curlGetSyncLegacy(const FetchArgument &argument,
     if(retVal != CURLE_OK &&
        !outbound_fetch_shutdown_requested.load(std::memory_order_relaxed) &&
        (argument.method == HTTP_GET || argument.method == HTTP_HEAD) &&
-       is_recoverable_curl_error(retVal))
+       should_retry_curl_error(retVal, limit.abort_on_stall))
     {
         const ResourceControlSnapshot resources = resourceControlSnapshot();
         const bool performance_mode = performanceFetchMode(resources);
@@ -3356,7 +3486,7 @@ static int curlGetSyncLegacy(const FetchArgument &argument,
                 limit.request_context->requestId());
         for(uint8_t retry_attempt = 0;
             retVal != CURLE_OK && retry_attempt < retry_limit &&
-            is_recoverable_curl_error(retVal);
+            should_retry_curl_error(retVal, limit.abort_on_stall);
             ++retry_attempt)
         {
             const std::chrono::milliseconds retry_delay =
@@ -3492,6 +3622,7 @@ static AsyncFetchRequest makeAsyncFetchRequest(
     request.context = argument.context;
     request.public_fetch_restricted =
         isPublicFetchRestricted(argument.context);
+    request.abort_on_stall = argument.abort_on_stall;
     request.deadline = networkFetchDeadline(argument.deadline);
     request.cancellation = argument.cancellation;
     request.request_context = captureCurrentRequestContext();
@@ -3665,20 +3796,31 @@ static int curlGetWithGitHubFallback(
     const ResolvedProxyRoute &initial_route, FetchResult &result,
     AsyncFetchFailure *return_failure = nullptr)
 {
+    // 先算回退源：只有确实有回退可走的取源才给直连加"停滞即失败"保护，
+    // 其余请求保持原有行为。
+    string_array fallback_urls;
+    if(argument.method == HTTP_GET && !argument.keep_resp_on_fail)
+        build_github_fallback_urls(argument.url, fallback_urls);
+
+    FetchArgument primary_argument {argument.method, argument.url, argument.proxy,
+                                    argument.post_data, argument.request_headers,
+                                    argument.cookies, argument.cache_ttl,
+                                    argument.keep_resp_on_fail,
+                                    argument.context, argument.deadline,
+                                    argument.cancellation,
+                                    !fallback_urls.empty()};
+
     CURLcode original_code = CURLE_OK;
     AsyncFetchFailure original_failure = AsyncFetchFailure::None;
     int original_status =
-        curlGet(argument, initial_route, result, &original_code,
+        curlGet(primary_argument, initial_route, result, &original_code,
                 &original_failure);
     if(return_failure)
         *return_failure = original_failure;
 
-    std::string fallback_url;
-    if(argument.method != HTTP_GET || argument.keep_resp_on_fail ||
-       original_status == 200 ||
+    if(fallback_urls.empty() || original_status == 200 ||
        outbound_fetch_shutdown_requested.load(std::memory_order_relaxed) ||
-       !should_try_jsdelivr_fallback(original_code, original_status) ||
-       !build_jsdelivr_github_url(argument.url, fallback_url))
+       !should_try_github_fallback(original_code, original_status))
         return original_status;
 
     std::string original_headers, original_cookies;
@@ -3687,41 +3829,70 @@ static int curlGetWithGitHubFallback(
     if(result.cookies)
         original_cookies = *result.cookies;
 
-    writeLog(LOG_LEVEL_WARNING,
-             "GitHub Raw 获取失败，正在尝试 jsDelivr 回退源：" +
-                  summarizeUrlForLog(fallback_url));
-    clear_fetch_output(result);
-
-    FetchArgument fallback_argument {HTTP_GET, fallback_url, argument.proxy,
-                                     nullptr, argument.request_headers,
-                                     argument.cookies, argument.cache_ttl,
-                                     argument.keep_resp_on_fail,
-                                      argument.context, argument.deadline,
-                                      argument.cancellation};
-    const ResolvedProxyRoute fallback_route =
-        resolveProxyRoute(snapshot, fallback_url, argument.context);
-    CURLcode fallback_code = CURLE_OK;
-    int fallback_status =
-        curlGet(fallback_argument, fallback_route, result, &fallback_code);
-    if(fallback_code == CURLE_OK && fallback_status == 200)
+    size_t attempted = 0;
+    for(size_t index = 0; index < fallback_urls.size(); index++)
     {
-        if(return_failure)
-            *return_failure = AsyncFetchFailure::None;
-        writeLog(LOG_LEVEL_INFO,
-                 "GitHub Raw 已通过 jsDelivr 回退源获取成功：" +
-                      summarizeUrlForLog(fallback_url));
-        return fallback_status;
+        if(outbound_fetch_shutdown_requested.load(std::memory_order_relaxed))
+            break;
+        if(github_fallback_budget_exhausted(argument.deadline))
+        {
+            writeLog(LOG_LEVEL_VERBOSE,
+                     "GitHub Raw 回退源预算已耗尽，跳过剩余回退源。");
+            break;
+        }
+
+        const std::string &fallback_url = fallback_urls[index];
+        const std::string attempt_label = github_fallback_attempt_label(
+            index + 1, fallback_urls.size());
+        writeLog(LOG_LEVEL_VERBOSE,
+                 "正在尝试 GitHub 回退源" + attempt_label +
+                     summarizeUrlForLog(fallback_url));
+        attempted++;
+        clear_fetch_output(result);
+
+        FetchArgument fallback_argument {HTTP_GET, fallback_url, argument.proxy,
+                                         nullptr, argument.request_headers,
+                                         argument.cookies, argument.cache_ttl,
+                                         argument.keep_resp_on_fail,
+                                         argument.context,
+                                         github_fallback_deadline(
+                                             argument.deadline,
+                                             fallback_urls.size() - index),
+                                         argument.cancellation, true};
+        const ResolvedProxyRoute fallback_route =
+            resolveProxyRoute(snapshot, fallback_url, argument.context);
+        CURLcode fallback_code = CURLE_OK;
+        int fallback_status =
+            curlGet(fallback_argument, fallback_route, result, &fallback_code);
+        if(fallback_code == CURLE_OK && fallback_status == 200)
+        {
+            if(return_failure)
+                *return_failure = AsyncFetchFailure::None;
+            writeLog(LOG_LEVEL_INFO,
+                     "GitHub Raw 已通过回退源获取成功" + attempt_label +
+                         summarizeUrlForLog(fallback_url));
+            return fallback_status;
+        }
+
+        writeLog(LOG_LEVEL_VERBOSE,
+                 "GitHub 回退源未命中" + attempt_label + " code=" +
+                     std::to_string(static_cast<int>(fallback_code)) +
+                     " status=" + std::to_string(fallback_status) +
+                     "：" + summarizeUrlForLog(fallback_url));
     }
 
-    writeLog(LOG_LEVEL_WARNING,
-             "GitHub Raw 通过 jsDelivr 回退源获取失败：" +
-                 summarizeUrlForLog(fallback_url));
     clear_fetch_output(result);
     if(result.response_headers)
         *result.response_headers = original_headers;
     if(result.cookies)
         *result.cookies = original_cookies;
     *result.status_code = original_status;
+    if(attempted > 0)
+        writeLog(LOG_LEVEL_WARNING,
+                 "GitHub Raw 回退源未命中（已尝试 " +
+                     std::to_string(attempted) + "/" +
+                     std::to_string(fallback_urls.size()) + " 个）：" +
+                     summarizeUrlForLog(argument.url));
     return original_status;
 }
 
@@ -4740,7 +4911,7 @@ void submitAsyncOwnedCacheFinalize(
 
 AsyncFetchRequest makeAsyncOwnedCacheRequest(
     const std::shared_ptr<AsyncOwnedCacheFetch> &state,
-    std::string url)
+    std::string url, bool abort_on_stall = false)
 {
     AsyncFetchRequest request;
     request.method = HTTP_GET;
@@ -4752,6 +4923,7 @@ AsyncFetchRequest makeAsyncOwnedCacheRequest(
     request.capture_response_headers = true;
     request.keep_resp_on_fail = false;
     request.context = state->request.context;
+    request.abort_on_stall = abort_on_stall;
     request.deadline = state->operation->workDeadline();
     request.cancellation = state->operation->workCancellationToken();
     request.retain_result_bytes = true;
@@ -4774,15 +4946,114 @@ void finishAsyncOwnedCacheNetwork(
     }
 }
 
+// 顺序尝试各回退源，全部失败后交回原始结果。
+struct AsyncOwnedCacheFallbackChain
+{
+    std::shared_ptr<AsyncOwnedCacheFetch> state;
+    SharedAsyncFetchResult original;
+    string_array fallback_urls;
+    size_t next_index = 0;
+};
+
+void submitAsyncOwnedCacheFallback(
+    const std::shared_ptr<AsyncOwnedCacheFallbackChain> &chain) noexcept
+{
+    try
+    {
+        const std::shared_ptr<AsyncOwnedCacheFetch> &state = chain->state;
+        if(outbound_fetch_shutdown_requested.load(std::memory_order_relaxed))
+        {
+            finishAsyncOwnedCacheNetwork(state, std::move(chain->original));
+            return;
+        }
+        if(chain->next_index >= chain->fallback_urls.size())
+        {
+            writeLog(LOG_LEVEL_WARNING,
+                     "GitHub Raw 回退源未命中（已尝试 " +
+                         std::to_string(chain->fallback_urls.size()) + " 个）：" +
+                         summarizeUrlForLog(state->effective_url));
+            finishAsyncOwnedCacheNetwork(state, std::move(chain->original));
+            return;
+        }
+        if(github_fallback_budget_exhausted(state->operation->workDeadline()))
+        {
+            writeLog(LOG_LEVEL_VERBOSE,
+                     "GitHub Raw 回退源预算已耗尽，跳过剩余回退源。");
+            finishAsyncOwnedCacheNetwork(state, std::move(chain->original));
+            return;
+        }
+
+        const size_t attempts_left =
+            chain->fallback_urls.size() - chain->next_index;
+        const std::string fallback_url =
+            chain->fallback_urls[chain->next_index++];
+        const std::string attempt_log =
+            github_fallback_attempt_label(chain->next_index,
+                                          chain->fallback_urls.size()) +
+            summarizeUrlForLog(fallback_url);
+        writeLog(LOG_LEVEL_VERBOSE, "正在尝试 GitHub 回退源" + attempt_log);
+        const ResolvedProxyRoute fallback_route =
+            resolveProxyRoute(state->proxy_snapshot, fallback_url,
+                              state->request.context);
+        AsyncFetchRequest fallback_request =
+            makeAsyncOwnedCacheRequest(state, fallback_url, true);
+        fallback_request.deadline = github_fallback_deadline(
+            state->operation->workDeadline(), attempts_left);
+        multiEngine().submit(
+            std::move(fallback_request), fallback_route,
+            state->allow_insecure_tls, state->max_download_size,
+            [chain, attempt_log](
+                SharedAsyncFetchResult fallback) mutable noexcept {
+                try
+                {
+                    if(fallback &&
+                       fallback->transport_code == CURLE_OK &&
+                       fallback->status_code == 200)
+                    {
+                        writeLog(LOG_LEVEL_INFO,
+                                 "GitHub Raw 已通过回退源获取成功" +
+                                     attempt_log);
+                        finishAsyncOwnedCacheNetwork(chain->state,
+                                                     std::move(fallback));
+                        return;
+                    }
+                    writeLog(LOG_LEVEL_VERBOSE,
+                             "GitHub 回退源未命中" + attempt_log + " code=" +
+                                 std::to_string(static_cast<int>(
+                                     fallback ? fallback->transport_code
+                                              : CURLE_FAILED_INIT)) +
+                                 " status=" +
+                                 std::to_string(fallback
+                                                    ? fallback->status_code
+                                                    : 0));
+                    submitAsyncOwnedCacheFallback(chain);
+                }
+                catch(...)
+                {
+                    publishAsyncOwnedCacheException(
+                        chain->state, std::current_exception());
+                }
+            });
+    }
+    catch(...)
+    {
+        publishAsyncOwnedCacheException(chain->state, std::current_exception());
+    }
+}
+
 void startAsyncOwnedCacheNetwork(
     const std::shared_ptr<AsyncOwnedCacheFetch> &state)
 {
+    // 有回退可走时给直连加"停滞即失败"保护，避免被黑洞的 GitHub 占满整段预算。
+    string_array fallback_urls;
+    build_github_fallback_urls(state->effective_url, fallback_urls);
     AsyncFetchRequest request = makeAsyncOwnedCacheRequest(
-        state, state->effective_url);
+        state, state->effective_url, !fallback_urls.empty());
     multiEngine().submit(
         std::move(request), state->initial_route,
         state->allow_insecure_tls, state->max_download_size,
-        [state](SharedAsyncFetchResult original) mutable noexcept {
+        [state, fallback_urls = std::move(fallback_urls)](
+            SharedAsyncFetchResult original) mutable noexcept {
             try
             {
                 const CURLcode original_code = original
@@ -4790,53 +5061,25 @@ void startAsyncOwnedCacheNetwork(
                     : CURLE_FAILED_INIT;
                 const int original_status = original
                     ? original->status_code : 0;
-                std::string fallback_url;
                 if(original && original_status != 200 &&
                    !outbound_fetch_shutdown_requested.load(
                        std::memory_order_relaxed) &&
-                   should_try_jsdelivr_fallback(original_code,
+                   should_try_github_fallback(original_code,
                                                  original_status) &&
-                   build_jsdelivr_github_url(state->effective_url,
-                                             fallback_url))
+                   !fallback_urls.empty())
                 {
-                    writeLog(LOG_LEVEL_WARNING,
-                             "GitHub Raw 获取失败，正在尝试 jsDelivr 回退源：" +
-                                 summarizeUrlForLog(fallback_url));
-                    const ResolvedProxyRoute fallback_route =
-                        resolveProxyRoute(state->proxy_snapshot,
-                                          fallback_url,
-                                          state->request.context);
-                    AsyncFetchRequest fallback_request =
-                        makeAsyncOwnedCacheRequest(state, fallback_url);
                     // The original body remains charged to retained_bytes (or
-                    // its request context) while the fallback is in flight.
+                    // its request context) while the fallbacks are in flight.
                     // Release the fetch reservation first so one sequential
                     // fallback cannot deadlock against its own full-size
                     // reservation.
                     original->fetch_memory.reset();
-                    multiEngine().submit(
-                        std::move(fallback_request), fallback_route,
-                        state->allow_insecure_tls,
-                        state->max_download_size,
-                        [state, original = std::move(original)](
-                            SharedAsyncFetchResult fallback) mutable noexcept {
-                            if(fallback &&
-                               fallback->transport_code == CURLE_OK &&
-                               fallback->status_code == 200)
-                            {
-                                writeLog(LOG_LEVEL_INFO,
-                                         "GitHub Raw 已通过 jsDelivr 回退源获取成功。" );
-                                finishAsyncOwnedCacheNetwork(
-                                    state, std::move(fallback));
-                            }
-                            else
-                            {
-                                writeLog(LOG_LEVEL_WARNING,
-                                         "GitHub Raw 通过 jsDelivr 回退源获取失败。" );
-                                finishAsyncOwnedCacheNetwork(
-                                    state, std::move(original));
-                            }
-                        });
+                    auto chain =
+                        std::make_shared<AsyncOwnedCacheFallbackChain>();
+                    chain->state = state;
+                    chain->original = std::move(original);
+                    chain->fallback_urls = std::move(fallback_urls);
+                    submitAsyncOwnedCacheFallback(chain);
                     return;
                 }
                 finishAsyncOwnedCacheNetwork(state, std::move(original));
@@ -4890,7 +5133,7 @@ struct AsyncOwnedDirectFetch
 
 AsyncFetchRequest makeAsyncOwnedDirectRequest(
     const std::shared_ptr<AsyncOwnedDirectFetch> &state,
-    std::string url)
+    std::string url, bool abort_on_stall = false)
 {
     AsyncFetchRequest request;
     request.method = HTTP_GET;
@@ -4903,6 +5146,7 @@ AsyncFetchRequest makeAsyncOwnedDirectRequest(
         state->request.capture_response_headers;
     request.keep_resp_on_fail = false;
     request.context = state->request.context;
+    request.abort_on_stall = abort_on_stall;
     request.deadline = state->consumer->context->deadline();
     request.cancellation =
         state->consumer->context->cancellationToken();
@@ -4948,15 +5192,120 @@ void completeAsyncOwnedDirectFetch(
     }
 }
 
+// 顺序尝试各回退源，全部失败后交回原始结果。
+struct AsyncOwnedDirectFallbackChain
+{
+    std::shared_ptr<AsyncOwnedDirectFetch> state;
+    SharedAsyncFetchResult original;
+    string_array fallback_urls;
+    size_t next_index = 0;
+};
+
+void submitAsyncOwnedDirectFallback(
+    const std::shared_ptr<AsyncOwnedDirectFallbackChain> &chain) noexcept
+{
+    try
+    {
+        const std::shared_ptr<AsyncOwnedDirectFetch> &state = chain->state;
+        if(outbound_fetch_shutdown_requested.load(std::memory_order_relaxed))
+        {
+            completeAsyncOwnedDirectFetch(state, std::move(chain->original));
+            return;
+        }
+        if(chain->next_index >= chain->fallback_urls.size())
+        {
+            writeLog(LOG_LEVEL_WARNING,
+                     "GitHub Raw 回退源未命中（已尝试 " +
+                         std::to_string(chain->fallback_urls.size()) + " 个）：" +
+                         summarizeUrlForLog(state->effective_url));
+            completeAsyncOwnedDirectFetch(state, std::move(chain->original));
+            return;
+        }
+        if(github_fallback_budget_exhausted(
+               state->consumer->context->deadline()))
+        {
+            writeLog(LOG_LEVEL_VERBOSE,
+                     "GitHub Raw 回退源预算已耗尽，跳过剩余回退源。");
+            completeAsyncOwnedDirectFetch(state, std::move(chain->original));
+            return;
+        }
+
+        const size_t attempts_left =
+            chain->fallback_urls.size() - chain->next_index;
+        const std::string fallback_url =
+            chain->fallback_urls[chain->next_index++];
+        const std::string attempt_log =
+            github_fallback_attempt_label(chain->next_index,
+                                          chain->fallback_urls.size()) +
+            summarizeUrlForLog(fallback_url);
+        writeLog(LOG_LEVEL_VERBOSE, "正在尝试 GitHub 回退源" + attempt_log);
+        const ResolvedProxyRoute fallback_route =
+            resolveProxyRoute(state->proxy_snapshot, fallback_url,
+                              state->request.context);
+        AsyncFetchRequest fallback_request =
+            makeAsyncOwnedDirectRequest(state, fallback_url, true);
+        fallback_request.deadline = github_fallback_deadline(
+            state->consumer->context->deadline(), attempts_left);
+        multiEngine().submit(
+            std::move(fallback_request), fallback_route,
+            state->allow_insecure_tls, state->max_download_size,
+            [chain, attempt_log](
+                SharedAsyncFetchResult fallback) mutable noexcept {
+                try
+                {
+                    if(fallback &&
+                       fallback->transport_code == CURLE_OK &&
+                       fallback->status_code == 200)
+                    {
+                        writeLog(LOG_LEVEL_INFO,
+                                 "GitHub Raw 已通过回退源获取成功" +
+                                     attempt_log);
+                        completeAsyncOwnedDirectFetch(chain->state,
+                                                      std::move(fallback));
+                        return;
+                    }
+                    writeLog(LOG_LEVEL_VERBOSE,
+                             "GitHub 回退源未命中" + attempt_log + " code=" +
+                                 std::to_string(static_cast<int>(
+                                     fallback ? fallback->transport_code
+                                              : CURLE_FAILED_INIT)) +
+                                 " status=" +
+                                 std::to_string(fallback
+                                                    ? fallback->status_code
+                                                    : 0));
+                    submitAsyncOwnedDirectFallback(chain);
+                }
+                catch(...)
+                {
+                    completeOwnedWebGetAsyncConsumer(
+                        chain->state->consumer,
+                        {{}, AsyncFetchFailure::Transport,
+                         RequestCancellationReason::None});
+                }
+            });
+    }
+    catch(...)
+    {
+        completeOwnedWebGetAsyncConsumer(
+            chain->state->consumer,
+            {{}, AsyncFetchFailure::Transport,
+             RequestCancellationReason::None});
+    }
+}
+
 void startAsyncOwnedDirectFetch(
     const std::shared_ptr<AsyncOwnedDirectFetch> &state)
 {
+    // 有回退可走时给直连加"停滞即失败"保护，避免被黑洞的 GitHub 占满整段预算。
+    string_array fallback_urls;
+    build_github_fallback_urls(state->effective_url, fallback_urls);
     AsyncFetchRequest request = makeAsyncOwnedDirectRequest(
-        state, state->effective_url);
+        state, state->effective_url, !fallback_urls.empty());
     multiEngine().submit(
         std::move(request), state->initial_route,
         state->allow_insecure_tls, state->max_download_size,
-        [state](SharedAsyncFetchResult original) mutable noexcept {
+        [state, fallback_urls = std::move(fallback_urls)](
+            SharedAsyncFetchResult original) mutable noexcept {
             try
             {
                 const CURLcode original_code = original
@@ -4964,37 +5313,20 @@ void startAsyncOwnedDirectFetch(
                     : CURLE_FAILED_INIT;
                 const int original_status = original
                     ? original->status_code : 0;
-                std::string fallback_url;
                 if(original && original_status != 200 &&
                    !outbound_fetch_shutdown_requested.load(
                        std::memory_order_relaxed) &&
-                   should_try_jsdelivr_fallback(original_code,
+                   should_try_github_fallback(original_code,
                                                  original_status) &&
-                   build_jsdelivr_github_url(state->effective_url,
-                                             fallback_url))
+                   !fallback_urls.empty())
                 {
-                    const ResolvedProxyRoute fallback_route =
-                        resolveProxyRoute(state->proxy_snapshot,
-                                          fallback_url,
-                                          state->request.context);
-                    AsyncFetchRequest fallback_request =
-                        makeAsyncOwnedDirectRequest(state, fallback_url);
                     original->fetch_memory.reset();
-                    multiEngine().submit(
-                        std::move(fallback_request), fallback_route,
-                        state->allow_insecure_tls,
-                        state->max_download_size,
-                        [state, original = std::move(original)](
-                            SharedAsyncFetchResult fallback) mutable noexcept {
-                            if(fallback &&
-                               fallback->transport_code == CURLE_OK &&
-                               fallback->status_code == 200)
-                                completeAsyncOwnedDirectFetch(
-                                    state, std::move(fallback));
-                            else
-                                completeAsyncOwnedDirectFetch(
-                                    state, std::move(original));
-                        });
+                    auto chain =
+                        std::make_shared<AsyncOwnedDirectFallbackChain>();
+                    chain->state = state;
+                    chain->original = std::move(original);
+                    chain->fallback_urls = std::move(fallback_urls);
+                    submitAsyncOwnedDirectFallback(chain);
                     return;
                 }
                 completeAsyncOwnedDirectFetch(state, std::move(original));

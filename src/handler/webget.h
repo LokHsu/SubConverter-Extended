@@ -38,12 +38,14 @@ struct FetchArgument
         FetchContext context = FetchContext::TrustedConfig,
         std::chrono::steady_clock::time_point deadline =
             std::chrono::steady_clock::time_point::max(),
-        RequestCancellationToken cancellation = {})
+        RequestCancellationToken cancellation = {},
+        bool abort_on_stall = false)
         : method(method), url(std::move(url)), proxy(std::move(proxy)),
           post_data(post_data), request_headers(request_headers),
           cookies(cookies), cache_ttl(cache_ttl),
           keep_resp_on_fail(keep_resp_on_fail), context(context),
-          deadline(deadline), cancellation(std::move(cancellation)) {}
+          deadline(deadline), cancellation(std::move(cancellation)),
+          abort_on_stall(abort_on_stall) {}
 
     const http_method method;
     const std::string url;
@@ -57,6 +59,9 @@ struct FetchArgument
     const std::chrono::steady_clock::time_point deadline =
         std::chrono::steady_clock::time_point::max();
     const RequestCancellationToken cancellation;
+    // GitHub 直连被黑洞时连接与 TLS 都能成功，但响应迟迟不来，会一直挂到请求
+    // 截止时间，把回退源的预算耗光。置位后该请求长时间收不到数据即判定失败。
+    const bool abort_on_stall = false;
 };
 
 struct FetchResult
@@ -96,6 +101,8 @@ struct AsyncFetchRequest
     bool keep_resp_on_fail = false;
     FetchContext context = FetchContext::TrustedConfig;
     bool public_fetch_restricted = false;
+    // 见 FetchArgument::abort_on_stall。
+    bool abort_on_stall = false;
     std::chrono::steady_clock::time_point deadline =
         std::chrono::steady_clock::time_point::max();
     RequestCancellationToken cancellation;
