@@ -1,0 +1,18 @@
+# GitHub 加速代理列表 / GitHub acceleration proxy list
+#
+# 直连 GitHub 失败时，按下面的顺序依次尝试这些代理，全部失败才回退 jsDelivr。
+# Tried in order when direct access fails; falls back to jsDelivr only after all of them fail.
+#
+# 每行一个代理前缀，程序会把原始 GitHub 地址直接拼接在后面，例如：
+#   https://gh-proxy.com/https://raw.githubusercontent.com/owner/repo/main/rules.list
+# 空行、以 # 或 ; 开头的行会被忽略；条目自动兼容是否带结尾的 /。
+#
+# 代理列表只来自本文件：缺失本文件或条目为空时都不启用加速代理，直接回退 jsDelivr。
+# 修改后需重启服务生效。
+#
+# 容器内路径 /base/github-proxies.txt，compose 挂载示例：
+#   - "./base/github-proxies.txt:/base/github-proxies.txt:ro"
+
+https://gh-proxy.com/
+https://ghproxy.net/
+https://ghfast.top/
