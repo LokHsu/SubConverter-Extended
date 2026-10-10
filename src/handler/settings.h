@@ -18,6 +18,7 @@
 #include <toml.hpp>
 
 #include "config/proxy_provider_direct.h"
+#include "config/proxy_provider_health_check.h"
 #include "config/proxy_provider_interval.h"
 
 inline constexpr char kDefaultStashRuleBase[] = "base/stash.yaml";
@@ -92,6 +93,9 @@ struct Settings {
   int updateInterval = 0;
   int proxyProviderInterval = kDefaultProxyProviderInterval;
   bool proxyProviderDirect = kDefaultProxyProviderDirect;
+  int proxyProviderHealthCheckInterval =
+      kDefaultProxyProviderHealthCheckInterval;
+  std::string proxyProviderHealthCheckUrl = kDefaultProxyProviderHealthCheckUrl;
   bool surgePolicyPath = true;
   bool surfboardPolicyPath = true;
   bool loonRemoteProxy = true;

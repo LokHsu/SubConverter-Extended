@@ -303,6 +303,30 @@ static bool requireProxyProviderDirect(const std::string &value) {
   return proxy_direct;
 }
 
+static int requireProxyProviderHealthCheckInterval(const std::string &value) {
+  int interval = 0;
+  if (!parseProxyProviderHealthCheckInterval(value, interval)) {
+    throw std::invalid_argument(
+        "proxy_provider.health_check_interval 必须是 1 到 2147483647 之间的"
+        "十进制整数。");
+  }
+  return interval;
+}
+
+static int requireProxyProviderHealthCheckInterval(std::int64_t value) {
+  return requireProxyProviderHealthCheckInterval(std::to_string(value));
+}
+
+static std::string requireProxyProviderHealthCheckUrl(const std::string &value) {
+  std::string url;
+  if (!parseProxyProviderHealthCheckUrl(value, url)) {
+    throw std::invalid_argument(
+        "proxy_provider.health_check_url 必须是以 http:// 或 https:// 开头、"
+        "且不含空白或控制字符的 URL。");
+  }
+  return url;
+}
+
 static bool pathInsideRoot(const std::string &path, const std::string &root) {
   return isPathInScope(path, root);
 }
@@ -470,6 +494,14 @@ static void finalizeRuntimeSettings() {
   if (global.proxyProviderInterval < 0) {
     throw std::invalid_argument(
         "proxy_provider.interval 必须是非负整数。");
+  }
+  if (global.proxyProviderHealthCheckInterval < 1) {
+    throw std::invalid_argument(
+        "proxy_provider.health_check_interval 必须是正整数。");
+  }
+  if (global.proxyProviderHealthCheckUrl.empty()) {
+    throw std::invalid_argument(
+        "proxy_provider.health_check_url 不能为空。");
   }
   finalizeBasicEnvironmentSettings();
   finalizeSecuritySettings();
@@ -1062,6 +1094,25 @@ void readYAMLConf(YAML::Node &node,
       global.proxyProviderDirect =
           requireProxyProviderDirect(proxy_direct.as<std::string>());
     }
+    YAML::Node health_check_interval = proxy_provider["health_check_interval"];
+    if (health_check_interval.IsDefined()) {
+      if (!health_check_interval.IsScalar()) {
+        throw std::invalid_argument(
+            "proxy_provider.health_check_interval 必须是十进制整数。");
+      }
+      global.proxyProviderHealthCheckInterval =
+          requireProxyProviderHealthCheckInterval(
+              health_check_interval.as<std::string>());
+    }
+    YAML::Node health_check_url = proxy_provider["health_check_url"];
+    if (health_check_url.IsDefined()) {
+      if (!health_check_url.IsScalar()) {
+        throw std::invalid_argument(
+            "proxy_provider.health_check_url 必须是字符串。");
+      }
+      global.proxyProviderHealthCheckUrl =
+          requireProxyProviderHealthCheckUrl(health_check_url.as<std::string>());
+    }
   }
 
   if (node["custom_openclash_rules"].IsDefined()) {
@@ -1411,6 +1462,27 @@ void readTOMLConf(toml::value &root,
       }
       global.proxyProviderDirect = proxy_direct.as_boolean();
     }
+    if (section_proxy_provider.contains("health_check_interval")) {
+      const auto &health_check_interval =
+          section_proxy_provider.as_table().at("health_check_interval");
+      if (!health_check_interval.is_integer()) {
+        throw std::invalid_argument(
+            "proxy_provider.health_check_interval 必须是 TOML 整数。");
+      }
+      global.proxyProviderHealthCheckInterval =
+          requireProxyProviderHealthCheckInterval(
+              health_check_interval.as_integer());
+    }
+    if (section_proxy_provider.contains("health_check_url")) {
+      const auto &health_check_url =
+          section_proxy_provider.as_table().at("health_check_url");
+      if (!health_check_url.is_string()) {
+        throw std::invalid_argument(
+            "proxy_provider.health_check_url 必须是 TOML 字符串。");
+      }
+      global.proxyProviderHealthCheckUrl = requireProxyProviderHealthCheckUrl(
+          health_check_url.as_string());
+    }
   }
 
   if (filter)
@@ -1685,6 +1757,9 @@ bool readConf() {
     global.proxyBypass = kDefaultProxyBypass;
     global.proxyProviderInterval = kDefaultProxyProviderInterval;
     global.proxyProviderDirect = kDefaultProxyProviderDirect;
+    global.proxyProviderHealthCheckInterval =
+        kDefaultProxyProviderHealthCheckInterval;
+    global.proxyProviderHealthCheckUrl = kDefaultProxyProviderHealthCheckUrl;
     global.stashBase = kDefaultStashRuleBase;
     global.surgePolicyPath = true;
     global.surfboardPolicyPath = true;
@@ -1847,6 +1922,18 @@ bool readConf() {
       ini.get_if_exist("proxy_direct", proxy_direct);
       global.proxyProviderDirect =
           requireProxyProviderDirect(proxy_direct);
+    }
+    if (ini.item_exist("health_check_interval")) {
+      std::string health_check_interval;
+      ini.get_if_exist("health_check_interval", health_check_interval);
+      global.proxyProviderHealthCheckInterval =
+          requireProxyProviderHealthCheckInterval(health_check_interval);
+    }
+    if (ini.item_exist("health_check_url")) {
+      std::string health_check_url;
+      ini.get_if_exist("health_check_url", health_check_url);
+      global.proxyProviderHealthCheckUrl =
+          requireProxyProviderHealthCheckUrl(health_check_url);
     }
   }
 

@@ -1882,6 +1882,9 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
   if (ext.use_proxy_provider && !ext.providers.empty()) {
     YAML::Node provider_node;
 
+    // 健康检查属于部署级策略，配置值对所有生成的 provider 生效
+    const Settings &provider_settings = effectiveSettings();
+
     for (const ProxyProvider &p : ext.providers) {
       YAML::Node single_provider;
       single_provider["type"] = "http";
@@ -1906,11 +1909,12 @@ void proxyToClash(std::vector<Proxy> &nodes, YAML::Node &yamlnode,
         single_provider["header"][name].push_back(value);
       }
 
-      // 健康检查配置
+      // 健康检查配置（默认值与 URL 可在配置文件的 [proxy_provider] 段调整）
       single_provider["health-check"]["enable"] = true;
       single_provider["health-check"]["url"] =
-          "https://www.gstatic.com/generate_204";
-      single_provider["health-check"]["interval"] = 300;
+          provider_settings.proxyProviderHealthCheckUrl;
+      single_provider["health-check"]["interval"] =
+          provider_settings.proxyProviderHealthCheckInterval;
 
       // 添加 override 配置（如果用户指定了 udp 或 scv 参数）
       bool has_override = false;

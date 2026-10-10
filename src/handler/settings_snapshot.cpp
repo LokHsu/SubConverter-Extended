@@ -78,6 +78,9 @@ std::string sanitizedSettingsSnapshot(const Settings &settings) {
        {
            {"interval", settings.proxyProviderInterval},
            {"proxy_direct", settings.proxyProviderDirect},
+           {"health_check_interval",
+            settings.proxyProviderHealthCheckInterval},
+           {"health_check_url", settings.proxyProviderHealthCheckUrl},
        }},
       {"remote_subscription",
        {

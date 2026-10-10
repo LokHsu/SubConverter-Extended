@@ -190,7 +190,7 @@ proxy_direct:false,https://example.com/sub
 - `ruleprepend` / `ruleappend`：向 Clash 完整规则的首尾插入远程规则来源；
 - `28800|no-resolve`：为 `clash-ipcidr` 规则集引用增加 `no-resolve`；
 - `provider_headers`：从当前请求中选择允许的请求头，并写入 Clash 或 Stash Provider；
-- `[proxy_provider]`：设置部署级 Provider 更新间隔和 `proxy: DIRECT` 默认行为。
+- `[proxy_provider]`：设置部署级 Provider 更新间隔、`proxy: DIRECT` 默认行为，以及生成 `proxy-providers` 时 `health-check` 的探测间隔和探测 URL。
 
 ---
 

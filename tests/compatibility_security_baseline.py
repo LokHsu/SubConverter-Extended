@@ -78,6 +78,8 @@ LOCAL_GROUP_MATCHER_CONFIG = "data:text/plain;base64," + base64.urlsafe_b64encod
     ).encode()
 ).decode()
 SELECT_HEALTH_URL = "https://www.gstatic.com/generate_204"
+PROVIDER_HEALTH_CHECK_INTERVAL = 90
+PROVIDER_HEALTH_CHECK_URL = "https://health.example.test/generate_204"
 SELECT_HEALTH_INI_CONFIG = "data:text/plain;base64," + base64.urlsafe_b64encode(
     "\n".join(
         (
@@ -1527,6 +1529,8 @@ def running_service(
     legacy_publish_enabled: bool = False,
     proxy_provider_interval: int | None = None,
     proxy_provider_direct: bool | None = None,
+    proxy_provider_health_check_interval: int | None = None,
+    proxy_provider_health_check_url: str | None = None,
     dashboard_client_ip_header: str | None = None,
     dashboard_trusted_proxy_cidrs: tuple[str, ...] = (),
     gist_api_base: str | None = None,
@@ -1571,13 +1575,28 @@ def running_service(
         baseline = baseline.replace(
             "publish_enabled = false", "publish_enabled = true"
         )
-    if proxy_provider_interval is not None or proxy_provider_direct is not None:
+    if (
+        proxy_provider_interval is not None
+        or proxy_provider_direct is not None
+        or proxy_provider_health_check_interval is not None
+        or proxy_provider_health_check_url is not None
+    ):
         provider_settings = ["[proxy_provider]"]
         if proxy_provider_interval is not None:
             provider_settings.append(f"interval = {proxy_provider_interval}")
         if proxy_provider_direct is not None:
             provider_settings.append(
                 f"proxy_direct = {str(proxy_provider_direct).lower()}"
+            )
+        if proxy_provider_health_check_interval is not None:
+            provider_settings.append(
+                "health_check_interval = "
+                f"{proxy_provider_health_check_interval}"
+            )
+        if proxy_provider_health_check_url is not None:
+            provider_settings.append(
+                "health_check_url = "
+                + json.dumps(proxy_provider_health_check_url)
             )
         baseline = baseline.replace(
             "[custom_openclash_rules]",
@@ -2352,6 +2371,40 @@ def deployment_security_defaults_baseline() -> None:
         raise AssertionError("Compose started forcing a security profile")
 
 
+def add_proxy_provider_health_check(
+    content: str, suffix: str, interval: str | None, url: str | None
+) -> str:
+    if suffix == ".ini":
+        marker = "\n[custom_openclash_rules]"
+        lines = ["\n[proxy_provider]"]
+        if interval is not None:
+            lines.append(f"health_check_interval={interval}")
+        if url is not None:
+            lines.append(f"health_check_url={url}")
+        section = "\n".join(lines) + "\n"
+    elif suffix == ".yml":
+        marker = "\ncustom_openclash_rules:"
+        lines = ["\nproxy_provider:"]
+        if interval is not None:
+            lines.append(f"  health_check_interval: {interval}")
+        if url is not None:
+            lines.append(f"  health_check_url: {json.dumps(url)}")
+        section = "\n".join(lines) + "\n"
+    elif suffix == ".toml":
+        marker = "\n[custom_openclash_rules]"
+        lines = ["\n[proxy_provider]"]
+        if interval is not None:
+            lines.append(f"health_check_interval = {interval}")
+        if url is not None:
+            lines.append(f"health_check_url = {json.dumps(url)}")
+        section = "\n".join(lines) + "\n"
+    else:
+        raise AssertionError(f"unsupported config suffix: {suffix}")
+    if marker not in content:
+        raise AssertionError(f"provider health-check insertion marker missing: {suffix}")
+    return content.replace(marker, section + marker, 1)
+
+
 def add_proxy_provider_interval(
     content: str, suffix: str, value: str
 ) -> str:
@@ -2690,6 +2743,106 @@ def settings_provider_direct_compatibility_baseline(helper: Path) -> None:
             raise AssertionError(
                 "INI/YAML/TOML provider direct snapshots differ for "
                 f"proxy_direct={expected}"
+            )
+
+
+def settings_provider_health_check_compatibility_baseline(helper: Path) -> None:
+    runtime_dir = REPOSITORY / "build" / "test-baseline-runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    cases = (
+        (60, "https://health.example.test/generate_204"),
+        (7200, "http://cp.cloudflare.com/generate_204"),
+    )
+    configured_snapshots: dict[
+        tuple[int, str], list[dict[str, object]]
+    ] = {case: [] for case in cases}
+    with tempfile.TemporaryDirectory(dir=runtime_dir) as temporary:
+        temporary_path = Path(temporary)
+        for fixture_name in (
+            "legacy-pref.ini",
+            "legacy-pref.yml",
+            "legacy-pref.toml",
+        ):
+            original = COMPAT_FIXTURES / fixture_name
+            content = original.read_text(encoding="utf-8")
+            for interval, url in cases:
+                configured = temporary_path / (
+                    f"configured-{interval}-" + fixture_name
+                )
+                configured.write_text(
+                    add_proxy_provider_health_check(
+                        content, original.suffix, str(interval), url
+                    ),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                snapshot = load_settings_snapshot(helper, configured)
+                provider = snapshot["proxy_provider"]
+                if (
+                    provider["health_check_interval"] != interval
+                    or provider["health_check_url"] != url
+                ):
+                    raise AssertionError(
+                        f"{original.suffix} did not load provider health-check "
+                        f"interval={interval} url={url}: {provider!r}"
+                    )
+                configured_snapshots[(interval, url)].append(snapshot)
+
+                reloaded = reload_settings_snapshot(helper, configured, original)
+                reloaded_provider = reloaded["proxy_provider"]
+                if (
+                    reloaded_provider["health_check_interval"] != 300
+                    or reloaded_provider["health_check_url"]
+                    != "https://www.gstatic.com/generate_204"
+                ):
+                    raise AssertionError(
+                        f"{original.suffix} hot reload retained a removed "
+                        "provider health-check value"
+                    )
+
+            invalid_cases = (
+                ("interval-zero", "0", None),
+                ("interval-negative", "-30", None),
+                ("interval-text", "none", None),
+                ("url-relative", None, "generate_204"),
+                ("url-bad-scheme", None, "ftp://health.example.test/generate_204"),
+                ("url-with-space", None, "https://health.example.test/a b"),
+            )
+            for label, interval, url in invalid_cases:
+                invalid = temporary_path / (f"invalid-{label}-" + fixture_name)
+                invalid_interval = interval
+                if (
+                    interval == "none"
+                    and original.suffix == ".toml"
+                ):
+                    invalid_interval = '"none"'
+                invalid.write_text(
+                    add_proxy_provider_health_check(
+                        content, original.suffix, invalid_interval, url
+                    ),
+                    encoding="utf-8",
+                    newline="\n",
+                )
+                startup = subprocess.run(
+                    [str(helper), str(invalid)],
+                    cwd=REPOSITORY,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if startup.returncode == 0:
+                    raise AssertionError(
+                        f"{original.suffix} accepted an invalid provider "
+                        f"health-check value: {label}"
+                    )
+
+    for case, snapshots in configured_snapshots.items():
+        if snapshots[1:] != snapshots[:1] * 2:
+            raise AssertionError(
+                "INI/YAML/TOML provider health-check snapshots differ for "
+                f"interval={case[0]} url={case[1]}"
             )
 
 
@@ -5538,6 +5691,31 @@ def provider_proxy_direct_from_output(output: str, provider_name: str) -> bool:
     return re.search(r"(?m)^    proxy: DIRECT\s*$", block) is not None
 
 
+def provider_health_check_interval_from_output(
+    output: str, provider_name: str
+) -> int:
+    block = provider_block_from_output(output, provider_name)
+    interval = re.search(r"(?m)^      interval: ([0-9]+)\s*$", block)
+    if interval is None:
+        raise AssertionError(
+            "provider health-check interval is missing or non-numeric: "
+            f"{provider_name}\n{block}"
+        )
+    return int(interval.group(1))
+
+
+def provider_health_check_url_from_output(
+    output: str, provider_name: str
+) -> str:
+    block = provider_block_from_output(output, provider_name)
+    url = re.search(r"(?m)^      url: (\S+)\s*$", block)
+    if url is None:
+        raise AssertionError(
+            f"provider health-check url is missing: {provider_name}\n{block}"
+        )
+    return url.group(1)
+
+
 def provider_direct_default_output_baseline(base_url: str, fixture_base: str) -> None:
     source = fixture_base + "/subscription.txt"
 
@@ -5632,7 +5810,7 @@ def provider_direct_default_output_baseline(base_url: str, fixture_base: str) ->
         )
 
 
-def provider_interval_output_baseline(base_url: str, fixture_base: str) -> None:
+def provider_settings_output_baseline(base_url: str, fixture_base: str) -> None:
     source = fixture_base + "/subscription.txt"
     multi_url = "|".join(
         (
@@ -5678,8 +5856,24 @@ def provider_interval_output_baseline(base_url: str, fixture_base: str) -> None:
             raise AssertionError(
                 f"{provider_name} proxy_direct mismatch: {actual} != {expected}"
             )
-    if output.count("      interval: 300") != 4:
-        raise AssertionError("provider health-check intervals changed")
+    for provider_name in ("Zero", "Slow", "Ordered", "Default"):
+        health_interval = provider_health_check_interval_from_output(
+            output, provider_name
+        )
+        if health_interval != PROVIDER_HEALTH_CHECK_INTERVAL:
+            raise AssertionError(
+                f"{provider_name} health-check interval mismatch: "
+                f"{health_interval} != {PROVIDER_HEALTH_CHECK_INTERVAL}"
+            )
+        health_url = provider_health_check_url_from_output(output, provider_name)
+        if health_url != PROVIDER_HEALTH_CHECK_URL:
+            raise AssertionError(
+                f"{provider_name} health-check url mismatch: {health_url!r}"
+            )
+    if output.count("      interval: 300") != 0:
+        raise AssertionError(
+            "provider health-check intervals ignored the configured value"
+        )
 
     encoded_value = urllib.parse.quote(
         f"provider:Encoded,interval:0,proxy_direct:false,{source}?case=encoded",
@@ -13614,6 +13808,7 @@ def main() -> int:
     settings_parser_diagnostic_redaction_baseline(settings_snapshot_helper)
     settings_provider_interval_compatibility_baseline(settings_snapshot_helper)
     settings_provider_direct_compatibility_baseline(settings_snapshot_helper)
+    settings_provider_health_check_compatibility_baseline(settings_snapshot_helper)
     settings_dashboard_client_ip_baseline(settings_snapshot_helper)
     fetch_shutdown_construction_race_baseline(settings_snapshot_helper)
 
@@ -13751,8 +13946,10 @@ def main() -> int:
             binary,
             proxy_provider_interval=7200,
             proxy_provider_direct=False,
+            proxy_provider_health_check_interval=PROVIDER_HEALTH_CHECK_INTERVAL,
+            proxy_provider_health_check_url=PROVIDER_HEALTH_CHECK_URL,
         ) as base_url:
-            provider_interval_output_baseline(base_url, fixture_base)
+            provider_settings_output_baseline(base_url, fixture_base)
         dashboard_baseline(binary, fixture_base)
         sensitive_log_baseline(binary, fixture_base)
         template_error_redaction_baseline(binary, fixture_base)

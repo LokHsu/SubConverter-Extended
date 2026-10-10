@@ -624,6 +624,13 @@ IF(BUILD_TESTS)
     ADD_TEST(NAME proxy_provider_direct COMMAND proxy_provider_direct_test)
     SET_TESTS_PROPERTIES(proxy_provider_direct PROPERTIES LABELS fast)
 
+    ADD_EXECUTABLE(proxy_provider_health_check_test
+        tests/proxy_provider_health_check_test.cpp)
+    TARGET_INCLUDE_DIRECTORIES(proxy_provider_health_check_test PRIVATE src)
+    ADD_TEST(NAME proxy_provider_health_check
+        COMMAND proxy_provider_health_check_test)
+    SET_TESTS_PROPERTIES(proxy_provider_health_check PROPERTIES LABELS fast)
+
     ADD_EXECUTABLE(mieru_uri_test
         tests/mieru_uri_test.cpp
         src/parser/mieru_uri.cpp)
@@ -713,6 +720,7 @@ IF(BUILD_TESTS)
         sub_request_key_test
         proxy_provider_interval_test
         proxy_provider_direct_test
+        proxy_provider_health_check_test
         mieru_uri_test
         curl_handle_pool_test
         file_scope_test

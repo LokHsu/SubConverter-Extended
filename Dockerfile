@@ -405,6 +405,8 @@ ENV TZ=Asia/Shanghai
 
 # 运行时依赖交给 apt：multiarch 目录、符号链接与 /etc/ld.so.cache 全部由包管理器维护
 # 包名按候选版本动态选择，避免 Debian 改名或 t64 迁移后写死包名
+# curl 是命令行工具（libcurl 库已由 "$curl_runtime" 提供），仅用于容器内排查
+# /healthz、/version 等端点，不参与服务运行。
 RUN set -eux; \
     pick_package() { \
       for candidate in "$@"; do \
@@ -422,6 +424,7 @@ RUN set -eux; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates \
       tzdata \
+      curl \
       "$curl_runtime" \
       libpcre2-8-0 \
       libstdc++6 \
