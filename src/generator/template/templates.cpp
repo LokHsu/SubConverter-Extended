@@ -892,16 +892,20 @@ int renderClashScript(YAML::Node &base_rule, std::vector<RulesetContent> &rulese
             !direct_url.empty() && hasExtension(direct_url, ".mrs");
         bool direct_txt =
             !direct_url.empty() && hasExtension(direct_url, ".txt");
+        bool direct_list =
+            !direct_url.empty() && hasExtension(direct_url, ".list");
         bool direct_yaml =
             !direct_url.empty() &&
             (hasExtension(direct_url, ".yaml") ||
              hasExtension(direct_url, ".yml"));
         std::string provider_format =
             direct_mrs ? "mrs" :
-            direct_txt ? "text" :
+            (direct_txt || direct_list) ? "text" :
             (direct_url.empty() || direct_yaml) ? "yaml" : "";
         const std::string provider_extension =
-            direct_mrs ? "mrs" : direct_txt ? "txt" : "yaml";
+            direct_mrs ? "mrs" :
+            direct_txt ? "txt" :
+            direct_list ? "list" : "yaml";
         bool group_has_domain = has_domain[x], group_has_ipcidr = has_ipcidr[x];
         int interval = ruleset_interval[x];
 
